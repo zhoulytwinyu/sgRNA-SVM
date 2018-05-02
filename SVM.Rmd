@@ -1,0 +1,239 @@
+---
+title: "R Notebook"
+output:
+  html_notebook: default
+  html_document: default
+  pdf_document: default
+---
+```{r setup, message=FALSE}
+library(tidyverse)
+library(pROC)
+library(kernlab)
+library(ggplot2)
+library(seqLogo)
+```
+
+# Read rank score
+```{r Read rank score file}
+sgRNA_rank_df <- read_tsv("sgRNA.rank.tsv",col_types = cols_only("Rank"=col_double(),
+                                                            "Sequence"=col_character())
+                  ) %>%
+  filter(Sequence != "n/a")
+rownames(sgRNA_rank_df) <- paste('sg',seq(1,nrow(sgRNA_rank_df)))
+sgRNA_rank_df <- sgRNA_rank_df %>% arrange(desc(Rank))
+nrow(sgRNA_rank_df)
+```
+
+```{r Explore sequence logo}
+params=rbind(lwb=c(0,0.2,0.4,0.6,0.8),upb=c(0.2,0.4,0.6,0.8,1))
+
+apply(params,2,function(param){
+  pwm <- sgRNA_rank_df %>%
+    filter(Rank>param[1] & Rank<=param[2]) %>%
+    pull(Sequence) %>%
+    strsplit(split='') %>%
+    simplify2array() %>%
+    t() %>%
+    apply(2,function(col){
+    return(c(A=mean(col=='A'),
+             T=mean(col=='T'),
+             G=mean(col=='G'),
+             C=mean(col=='C')
+             )
+           )
+    })
+  svg(paste("rank_logo_",param[1],'-',param[2],".svg",sep=''))
+  seqLogo(makePWM(pwm))
+  dev.off()
+  return()
+  })
+```
+
+```{r Rank histogram}
+hist(sgRNA_rank_df$Rank,
+     main="Histogram of sgRNA ranks",
+     xlab="rank")
+```
+```{r CV multiple kernel model}
+##The code attempts to use spectrum kernel to implicitely define features for sgRNAs.
+# Features weight differently at different position for sgRNA: GC rich subsequences close
+# to PAM site (3' end) are shown to have be prefered compared to same subsequences far away from PAM.
+# This properties calls for a feature space than separate a same substring at different 
+# regions as different features, e.g. ATG at region1, ATG at region2 ...
+# In CV below, we also explore a better demarcation of regions, in addition to substring length.
+
+#Setting random seed for reproduction
+#set.seed(10086)
+#Separate the sgRNA into "Top" and "Bottom" two classes each take half of data points
+minmax<-quantile(sgRNA_rank_df$Rank,c(0.5,0.5))
+sgRNA_rank_factor_df <- sgRNA_rank_df %>% 
+  filter(Rank > minmax[2] | Rank < minmax[1]) %>%
+  mutate(Rank=factor(ifelse(Rank>minmax[2],
+                                  "Top",
+                                  "Bottom"
+                            ),
+                     levels=c("Top","Bottom")
+                    )
+         )
+#Reserve 25% out of ~1800 sgRNAs for final model validation
+validation_ind <- sample(nrow(sgRNA_rank_factor_df),size=0.25*nrow(sgRNA_rank_factor_df),replace=FALSE)
+sgRNA_rank_factor_df.validation <- sgRNA_rank_factor_df[validation_ind,]
+sgRNA_rank_factor_df.train <- sgRNA_rank_factor_df[-validation_ind,]
+#CV: I would like to cross validate the choice of substring length and fragmentation of regions
+spectrum_length <-c(1,2,3)
+fragmentation <-c(1,2,3)
+sgRNA_len <- 30
+cv_rep <- 10
+cv_err <- matrix(0,nrow=length(fragmentation),ncol=length(spectrum_length))
+rownames(cv_err) <- fragmentation
+colnames(cv_err) <- spectrum_length
+test_err <-numeric(cv_rep)
+
+for (frag in fragmentation) {
+  for (len in spectrum_length) {
+    km_combined <- as.kernelMatrix(matrix(0,
+                                      nrow=length(sgRNA_rank_factor_df.train$Sequence),
+                                      ncol=length(sgRNA_rank_factor_df.train$Sequence)
+                                      )
+                               )
+    #Define string kernel of length len
+    sk<-stringdot(type = "spectrum",length=len)
+    #Define kernelMatrix using the kernel and data
+    for (i in 1:frag){
+      cat(frag,len,i,1+(i-1)*(sgRNA_len/frag),i*sgRNA_len/frag,'\n')
+      km_combined <- km_combined+kernelMatrix(sk,
+                                              sgRNA_rank_factor_df.train$Sequence %>% 
+                                                sapply(substring,
+                                                       1+(i-1)*(sgRNA_len/frag),
+                                                       i*sgRNA_len/frag
+                                                       )
+                                              )
+    }
+    for (c in 1:cv_rep){
+      #Randomly use 25% of training set as internal test set during each iteration of CV
+      test_ind<- sample(nrow(sgRNA_rank_factor_df.train),size=0.25*nrow(sgRNA_rank_factor_df.train),replace=FALSE)
+      itrain.label <- sgRNA_rank_factor_df.train[-test_ind,] %>% pull("Rank")
+      test.label <- sgRNA_rank_factor_df.train[test_ind,] %>% pull("Rank")
+      #Subset kernel matrix for training
+      km_combined_itrain <- km_combined[-test_ind,-test_ind]
+      mod <- ksvm(x=km_combined_itrain,y=itrain.label,kernel="matrix")
+      #Subset kernel matrix for testing (contains inner product of test points to support vectors)
+      km_combined_test <- km_combined[test_ind,-test_ind][,SVindex(mod),drop=FALSE]
+      test_err[c] <- mean(predict(mod,as.kernelMatrix(km_combined_test))!=test.label)
+    }
+    cv_err[as.character(frag),as.character(len)] <- mean(test_err)
+  }
+}
+```
+
+```{r final model}
+#Plot the CV error on a grid
+cv_err %>%
+  reshape2::melt() %>%
+  rename(Segmentation=Var1,Length=Var2) %>%
+  ggplot(aes(x = Segmentation, y = Length)) +
+  geom_tile(aes(x=Segmentation, y= Length, fill = value), color = "white") +
+  geom_text(aes(label = sprintf("%1.2f",value)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "steelblue",name="CV error")+
+  ggtitle("Cross Validation")
+
+#Train a final model using all training set
+length.best <- spectrum_length[ceiling(which.min(cv_err)/length(fragmentation))]
+fragmentation.best <- fragmentation[1+(which.min(cv_err)-1)%%length(fragmentation)]
+cat("The best parameter:",length.best,fragmentation.best,"\n")
+sk<-stringdot(type = "spectrum",length=length.best)
+km_combined <- matrix(0,
+                      nrow=length(sgRNA_rank_factor_df$Sequence),
+                      ncol=length(sgRNA_rank_factor_df$Sequence)
+                      )
+for (i in 1:fragmentation.best){
+  #cat(i,1+(i-1)*(sgRNA_len/fragmentation.best),i*sgRNA_len/fragmentation.best,'\n')
+  km_combined <- km_combined+kernelMatrix(sk,
+                                          sgRNA_rank_factor_df$Sequence %>%
+                                            sapply(substring,
+                                                    1+(i-1)*(sgRNA_len/fragmentation.best),
+                                                    i*sgRNA_len/fragmentation.best
+                                                   )
+                                          )
+}
+km_combined_train <- km_combined[-validation_ind,-validation_ind]
+#Fitting the model
+mod <- ksvm(x=as.kernelMatrix(km_combined_train),y=sgRNA_rank_factor_df.train$Rank,kernel="matrix",prob.model = TRUE)
+km_combined_validation <- as.kernelMatrix(km_combined[validation_ind,-validation_ind][,SVindex(mod),drop=FALSE])
+
+#Output results: validation error rate, confusion matrix and auc
+cat("The error rate on validation set is:",
+    mean(predict(mod,km_combined_validation)!=sgRNA_rank_factor_df.validation$Rank),
+    "\n\n")
+cat("Confusion matrix:\n")
+table(sgRNA_rank_factor_df.validation$Rank,predict(mod,km_combined_validation))
+roc<-roc(sgRNA_rank_factor_df.validation$Rank,predict(mod,km_combined_validation,type="probabilities")[,"Top"])
+auc(roc)
+
+#Plot results: roc, rank against prediction score  
+plot(roc,main="ROC")
+pred<-predict(mod,km_combined_validation,type="prob")[,"Top"]
+plot(pred,sgRNA_rank_df$Rank[validation_ind]
+     ,main="Using predicted probability as a score",xlab="Predicted preobability",ylab="Efficiency")
+```
+```{r feature weight}
+ay <- coef(mod)[[1]]
+#Convert support vectors into features
+sk<-stringdot(type = "spectrum",length=length.best)
+feat<-character(16)
+i<-1
+for (a in c("A","T","G","C")){
+  for (b in c("A","T","G","C")){
+    feat[i]=paste(a,b,sep='')
+    i<-i+1
+  }
+}
+km_combined <- cbind(kernelMatrix(sk,
+                                  sgRNA_rank_factor_df[-validation_ind,][SVindex(mod),] %>%
+                                    pull(Sequence) %>%
+                                    sapply(substring,
+                                            1,
+                                            sgRNA_len/fragmentation.best
+                                           ),
+                                  feat
+                                  ),
+                     kernelMatrix(sk,
+                                  sgRNA_rank_factor_df[-validation_ind,][SVindex(mod),] %>%
+                                    pull(Sequence) %>%
+                                    sapply(substring,
+                                            1+(sgRNA_len/fragmentation.best),
+                                            2*sgRNA_len/fragmentation.best
+                                           ),
+                                  feat
+                                  ),
+                     kernelMatrix(sk,
+                                  sgRNA_rank_factor_df[-validation_ind,][SVindex(mod),] %>%
+                                    pull(Sequence) %>%
+                                    sapply(substring,
+                                            1+2*(sgRNA_len/fragmentation.best),
+                                            3*sgRNA_len/fragmentation.best
+                                           ),
+                                  feat
+                                  )
+                     )
+
+weight_df <- data.frame(feature=c(feat,feat,feat),
+                        location=rep(c("5'","central","3'"),each=length(feat)),
+                        weight=colSums(ay*km_combined))
+plot(x=weight_df[weight_df["location"]=="5'","feature"],
+     y=weight_df[weight_df["location"]=="5'","weight"],
+     main="5' end (distal from PAM) substring preference",
+     xlab="substring",
+     ylab="weights")
+plot(x=weight_df[weight_df["location"]=="central","feature"],
+     y=weight_df[weight_df["location"]=="central","weight"],
+     main="central segment substring preference",
+     xlab="substring",
+     ylab="weights")
+plot(x=weight_df[weight_df["location"]=="3'","feature"],
+     y=weight_df[weight_df["location"]=="3'","weight"],
+     main="3' end (distal from PAM) substring preference",
+     xlab="substring",
+     ylab="weights")
+
+```
